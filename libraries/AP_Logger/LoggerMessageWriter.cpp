@@ -6,7 +6,10 @@
 #include "ap_version.h"
 #undef FORCE_VERSION_H_INCLUDE
 
-#define MIN_LOOP_TIME_REMAINING_FOR_MESSAGE_WRITE_US 200
+// the message writers are mainly called at the end of periodic_fullrate() with a budget of 300us
+// until they are finished calls to Write() will fail so we want to take up as much of
+// the budget as possible in order that logging can begin in earnest as early as possible
+#define MIN_LOOP_TIME_REMAINING_FOR_MESSAGE_WRITE_US 50
 
 extern const AP_HAL::HAL& hal;
 
@@ -19,11 +22,17 @@ void LoggerMessageWriter::reset()
     _finished = false;
 }
 
+bool LoggerMessageWriter::out_of_time_for_writing_messages() const
+{
+    return AP::scheduler().time_available_usec() < MIN_LOOP_TIME_REMAINING_FOR_MESSAGE_WRITE_US;
+}
+
 void LoggerMessageWriter_DFLogStart::reset()
 {
     LoggerMessageWriter::reset();
 
     _fmt_done = false;
+    _params_done = false;
     _writesysinfo.reset();
     _writeentiremission.reset();
     _writeallrallypoints.reset();
@@ -36,29 +45,48 @@ void LoggerMessageWriter_DFLogStart::reset()
     ap = AP_Param::first(&token, &type);
 }
 
+bool LoggerMessageWriter_DFLogStart::out_of_time_for_writing_messages() const
+{
+    if (stage == Stage::FORMATS) {
+        // write out the FMT messages as fast as we can
+        return AP::scheduler().time_available_usec() == 0;
+    }
+    return LoggerMessageWriter::out_of_time_for_writing_messages();
+}
+
 void LoggerMessageWriter_DFLogStart::process()
 {
+    if (out_of_time_for_writing_messages()) {
+        return;
+    }
+
     switch(stage) {
     case Stage::FORMATS:
         // write log formats so the log is self-describing
         while (next_format_to_send < _logger_backend->num_types()) {
-            if (AP::scheduler().time_available_usec() < MIN_LOOP_TIME_REMAINING_FOR_MESSAGE_WRITE_US) {
-                return;
-            }
             if (!_logger_backend->Write_Format(_logger_backend->structure(next_format_to_send))) {
                 return; // call me again!
             }
             next_format_to_send++;
         }
         _fmt_done = true;
+        stage = Stage::PARMS;
+        FALLTHROUGH;
+
+    case Stage::PARMS:
+        while (ap) {
+            if (!_logger_backend->Write_Parameter(ap, token, type)) {
+                return;
+            }
+            ap = AP_Param::next_scalar(&token, &type);
+        }
+
+        _params_done = true;
         stage = Stage::UNITS;
         FALLTHROUGH;
 
     case Stage::UNITS:
         while (_next_unit_to_send < _logger_backend->num_units()) {
-            if (AP::scheduler().time_available_usec() < MIN_LOOP_TIME_REMAINING_FOR_MESSAGE_WRITE_US) {
-                return;
-            }
             if (!_logger_backend->Write_Unit(_logger_backend->unit(_next_unit_to_send))) {
                 return; // call me again!
             }
@@ -69,9 +97,6 @@ void LoggerMessageWriter_DFLogStart::process()
 
     case Stage::MULTIPLIERS:
         while (_next_multiplier_to_send < _logger_backend->num_multipliers()) {
-            if (AP::scheduler().time_available_usec() < MIN_LOOP_TIME_REMAINING_FOR_MESSAGE_WRITE_US) {
-                return;
-            }
             if (!_logger_backend->Write_Multiplier(_logger_backend->multiplier(_next_multiplier_to_send))) {
                 return; // call me again!
             }
@@ -82,60 +107,32 @@ void LoggerMessageWriter_DFLogStart::process()
 
     case Stage::FORMAT_UNITS:
         while (_next_format_unit_to_send < _logger_backend->num_types()) {
-            if (AP::scheduler().time_available_usec() < MIN_LOOP_TIME_REMAINING_FOR_MESSAGE_WRITE_US) {
-                return;
-            }
             if (!_logger_backend->Write_Format_Units(_logger_backend->structure(_next_format_unit_to_send))) {
                 return; // call me again!
             }
             _next_format_unit_to_send++;
         }
-        stage = Stage::PARMS;
+        stage = Stage::RUNNING_SUBWRITERS;
         FALLTHROUGH;
 
-    case Stage::PARMS:
-        while (ap) {
-            if (AP::scheduler().time_available_usec() < MIN_LOOP_TIME_REMAINING_FOR_MESSAGE_WRITE_US) {
-                return;
-            }
-            if (!_logger_backend->Write_Parameter(ap, token, type)) {
-                return;
-            }
-            ap = AP_Param::next_scalar(&token, &type);
-        }
-
-        stage = Stage::SYSINFO;
-        FALLTHROUGH;
-
-    case Stage::SYSINFO:
-        _writesysinfo.process();
-        if (AP::scheduler().time_available_usec() < MIN_LOOP_TIME_REMAINING_FOR_MESSAGE_WRITE_US) {
-            return;
-        }
+    case Stage::RUNNING_SUBWRITERS:
         if (!_writesysinfo.finished()) {
-            return;
-        }
-        stage = Stage::WRITE_ENTIRE_MISSION;
-        FALLTHROUGH;
-
-    case Stage::WRITE_ENTIRE_MISSION:
-        _writeentiremission.process();
-        if (AP::scheduler().time_available_usec() < MIN_LOOP_TIME_REMAINING_FOR_MESSAGE_WRITE_US) {
-            return;
+            _writesysinfo.process();
+            if (!_writesysinfo.finished()) {
+                return;
+            }
         }
         if (!_writeentiremission.finished()) {
-            return;
-        }
-        stage = Stage::WRITE_ALL_RALLY_POINTS;
-        FALLTHROUGH;
-
-    case Stage::WRITE_ALL_RALLY_POINTS:
-        _writeallrallypoints.process();
-        if (AP::scheduler().time_available_usec() < MIN_LOOP_TIME_REMAINING_FOR_MESSAGE_WRITE_US) {
-            return;
+            _writeentiremission.process();
+            if (!_writeentiremission.finished()) {
+                return;
+            }
         }
         if (!_writeallrallypoints.finished()) {
-            return;
+            _writeallrallypoints.process();
+            if (!_writeallrallypoints.finished()) {
+                return;
+            }
         }
         stage = Stage::VEHICLE_MESSAGES;
         FALLTHROUGH;
@@ -160,20 +157,38 @@ void LoggerMessageWriter_DFLogStart::process()
     _finished = true;
 }
 
+bool LoggerMessageWriter_DFLogStart::writeentiremission()
+{
+    if (stage != Stage::DONE) {
+        return false;
+    }
+    stage = Stage::RUNNING_SUBWRITERS;
+    _finished = false;
+    _writeentiremission.reset();
+    return true;
+}
+
+bool LoggerMessageWriter_DFLogStart::writeallrallypoints()
+{
+    if (stage != Stage::DONE) {
+        return false;
+    }
+    stage = Stage::RUNNING_SUBWRITERS;
+    _finished = false;
+    _writeallrallypoints.reset();
+    return true;
+}
+
 void LoggerMessageWriter_WriteSysInfo::reset()
 {
     LoggerMessageWriter::reset();
-    stage = Stage::FORMATS;
+    stage = Stage::FIRMWARE_STRING;
 }
 
 void LoggerMessageWriter_WriteSysInfo::process() {
     const AP_FWVersion &fwver = AP::fwversion();
 
     switch(stage) {
-
-    case Stage::FORMATS:
-        stage = Stage::FIRMWARE_STRING;
-        FALLTHROUGH;
 
     case Stage::FIRMWARE_STRING:
         if (! _logger_backend->Write_Message(fwver.fw_string)) {
@@ -250,6 +265,9 @@ void LoggerMessageWriter_WriteAllRallyPoints::process()
 
     case Stage::WRITE_ALL_RALLY_POINTS:
         while (_rally_number_to_send < _rally->get_rally_total()) {
+            if (out_of_time_for_writing_messages()) {
+                return;
+            }
             RallyLocation rallypoint;
             if (_rally->get_rally_point_with_index(_rally_number_to_send, rallypoint)) {
                 if (!_logger_backend->Write_RallyPoint(
@@ -297,6 +315,9 @@ void LoggerMessageWriter_WriteEntireMission::process() {
     case Stage::WRITE_MISSION_ITEMS: {
         AP_Mission::Mission_Command cmd;
         while (_mission_number_to_send < _mission->num_commands()) {
+            if (out_of_time_for_writing_messages()) {
+                return;
+            }
             // upon failure to write the mission we will re-read from
             // storage; this could be improved.
             if (_mission->read_cmd_from_storage(_mission_number_to_send,cmd)) {
